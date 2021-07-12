@@ -33,6 +33,8 @@ from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
 import torchvision.transforms as transforms
 from torch.utils.data import random_split, IterableDataset
+import torch as th
+import torch
 
 import dgl
 import dgl.nn as dglnn
@@ -41,16 +43,15 @@ import dgl.nn as dglnn
 
 import pickle
 
-f = open('../GCN_training/ei.pkl','rb')
+f = open('data/GCN_training/ei.pkl','rb')
 ei = pickle.load(f)
 f.close()
 
-f = open('../GCN_training/ei_attr.pkl','rb')
+f = open('data/GCN_training/ei_attr.pkl','rb')
 ei_attr = pickle.load(f)
 f.close()
-print(ei_attr[:10])
 
-f = open('../GCN_training/seen.pkl','rb')
+f = open('data/GCN_training/seen.pkl','rb')
 seen = pickle.load(f)
 f.close()
 
@@ -63,7 +64,7 @@ def exp_data(fname):
     f.close()
     line=line[1:]
     ########
-    output=[[0,0] for j in range(len(seen)+1)]
+    output=[[0,0] for j in range(len(seen))]
     for l in line:
         prot,exp_value=l.split('\t')
         exp_value=float(exp_value)
@@ -98,17 +99,17 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 label = []
 feat_vecs=[]
-f=open('../testingset/data/BRCA_label.txt')
+f=open('data/testingset/data/BRCA_label.txt')
 lines=f.readlines()
 f.close()
 lines=lines[1:]
 for l in tqdm(lines):
     try:
         l=l.split('\t')
-        if os.path.isfile('../testingset/data/'+l[0]):
+        if os.path.isfile('data/testingset/data/'+l[0]):
             temp=l[1]
             label.append(temp)
-            exp_feature=exp_data('../testingset/data/'+l[0])
+            exp_feature=exp_data('data/testingset/data/'+l[0])
             metbo_feature = exp_feature
             feat_vecs.append(metbo_feature)
             #print(len(feat_vecs[0]))
@@ -145,11 +146,11 @@ for e in ei_attr:
 u = torch.tensor(ei[0], dtype=torch.long).to(device)
 v = torch.tensor(ei[1], dtype=torch.long).to(device)
 g = dgl.graph((u, v)).to(device)
+# g = dgl.add_self_loop(g)
 
 i = 0
 etypes = [dic[a[0]] for a in ei_attr]
 etypes = torch.tensor(etypes).to(device)
-
 
 def load_data():
     dataset=[]    
@@ -197,61 +198,146 @@ def get_batches(dataset, batch_size):
 def collate(samples):
     # The input `samples` is a list of pairs
     #  (graph, label).
-    g, etypes, x, y = map(list, zip(*samples))
-    graph_batch = dgl.batch(g)
-    return graph_batch, th.stack(etypes), th.stack(x), th.stack(labels)
+    batch_g, batch_etypes, x, y = map(list, zip(*samples))
+    graph_batch = dgl.batch(batch_g)
+    return graph_batch, th.cat(batch_etypes), th.cat(x).to(device), th.stack(y).to(device)
 
+
+
+def get_batch_id(num_nodes:torch.Tensor):
+    """Convert the num_nodes array obtained from batch graph to batch_id array
+    for each node.
+    Args:
+        num_nodes (torch.Tensor): The tensor whose element is the number of nodes
+            in each graph in the batch graph.
+    """
+    batch_size = num_nodes.size(0)
+    batch_ids = []
+    for i in range(batch_size):
+        item = torch.full((num_nodes[i],), i, dtype=torch.long, device=num_nodes.device)
+        batch_ids.append(item)
+    return torch.cat(batch_ids)
+
+
+def topk(x:torch.Tensor, ratio:float, batch_id:torch.Tensor, num_nodes:torch.Tensor):
+    """The top-k pooling method. Given a graph batch, this method will pool out some
+    nodes from input node feature tensor for each graph according to the given ratio.
+    Args:
+        x (torch.Tensor): The input node feature batch-tensor to be pooled.
+        ratio (float): the pool ratio. For example if :obj:`ratio=0.5` then half of the input
+            tensor will be pooled out.
+        batch_id (torch.Tensor): The batch_id of each element in the input tensor.
+        num_nodes (torch.Tensor): The number of nodes of each graph in batch.
     
+    Returns:
+        perm (torch.Tensor): The index in batch to be kept.
+        k (torch.Tensor): The remaining number of nodes for each graph.
+    """
+    batch_size, max_num_nodes = num_nodes.size(0), num_nodes.max().item()
+    
+    cum_num_nodes = torch.cat(
+        [num_nodes.new_zeros(1),
+         num_nodes.cumsum(dim=0)[:-1]], dim=0)
+    
+    index = torch.arange(batch_id.size(0), dtype=torch.long, device=x.device)
+    index = (index - cum_num_nodes[batch_id]) + (batch_id * max_num_nodes)
+
+    dense_x = x.new_full((batch_size * max_num_nodes, ), torch.finfo(x.dtype).min)
+    dense_x[index] = x
+    dense_x = dense_x.view(batch_size, max_num_nodes)
+
+    _, perm = dense_x.sort(dim=-1, descending=True)
+    perm = perm + cum_num_nodes.view(-1, 1)
+    perm = perm.view(-1)
+
+    k = (ratio * num_nodes.to(torch.float)).ceil().to(torch.long)
+    mask = [
+        torch.arange(k[i], dtype=torch.long, device=x.device) + 
+        i * max_num_nodes for i in range(batch_size)]
+
+    mask = torch.cat(mask, dim=0)
+    perm = perm[mask]
+
+    return perm, k
+
+class SAGPool(torch.nn.Module):
+    """The Self-Attention Pooling layer in paper 
+    `Self Attention Graph Pooling <https://arxiv.org/pdf/1904.08082.pdf>`
+    Args:
+        in_dim (int): The dimension of node feature.
+        ratio (float, optional): The pool ratio which determines the amount of nodes
+            remain after pooling. (default: :obj:`0.5`)
+        conv_op (torch.nn.Module, optional): The graph convolution layer in dgl used to
+        compute scale for each node. (default: :obj:`dgl.nn.GraphConv`)
+        non_linearity (Callable, optional): The non-linearity function, a pytorch function.
+            (default: :obj:`torch.tanh`)
+    """
+    def __init__(self, in_dim:int, ratio=0.5, conv_op=dglnn.GraphConv, non_linearity=torch.tanh):
+        super(SAGPool, self).__init__()
+        self.in_dim = in_dim
+        self.ratio = ratio
+        self.score_layer = conv_op(in_dim, 1, allow_zero_in_degree=True)
+        self.non_linearity = non_linearity
+    
+    def forward(self, graph:dgl.DGLGraph, feature:torch.Tensor):
+        score = self.score_layer(graph, feature).squeeze()
+        perm, next_batch_num_nodes = topk(score, self.ratio, get_batch_id(graph.batch_num_nodes()), graph.batch_num_nodes())
+        feature = feature[perm] * self.non_linearity(score[perm]).view(-1, 1)
+        graph = dgl.node_subgraph(graph, perm)
+
+        # node_subgraph currently does not support batch-graph,
+        # the 'batch_num_nodes' of the result subgraph is None.
+        # So we manually set the 'batch_num_nodes' here.
+        # Since global pooling has nothing to do with 'batch_num_edges',
+        # we can leave it to be None or unchanged.
+        graph.set_batch_num_nodes(next_batch_num_nodes)
+        
+        return graph, feature, perm
+
 
 class MyNet(nn.Module):
-    def __init__(self, l1=120, k=8, r=1, batch_size=2):
+    def __init__(self, l1=120, k=8, r=1, batch_size=1):
         super(MyNet, self).__init__()
 #         self.conv1 = RGCNConv(k1,k2,27)
 #         self.pool1 = SAGPooling(k2, ratio=r, GNN=GCNConv)
 #         self.conv2 = GCNConv(k2,l1) 
 #         self.fc1 = nn.Linear(l1,1)
         self.conv1 = dglnn.RelGraphConv(2, k, 27)
-        gate_nn = th.nn.Linear(k, 1)  # the gate layer that maps node feature to scalar
-        self.gap = dglnn.GlobalAttentionPooling(gate_nn)  # create a Global Attention Pooling layer
-        self.batch_size = batch_size
-        self.etypes = etypes
+        self.sag = SAGPool(k, ratio=r)
+        self.conv2 = dglnn.GraphConv(k, l1, allow_zero_in_degree=True)
+        self.max_pool = dglnn.MaxPooling()
+        self.fc1 = nn.Linear(l1, 1)
+        
 
 
-
-    def forward(self, g, data):
-        x, y = data
-        x = x.view(x.shape[1], -1)
-        x = F.relu(self.conv1(g, x, self.etypes))
-        x = self.gap(g, x)
-        print(x.shape)
-        return x
+    def forward(self, batch_g, batch_etypes, x, y):
+        x = F.relu(self.conv1(batch_g, x, batch_etypes))
+        batch_g, x, _ = self.sag(batch_g, x)
+        x = self.conv2(batch_g, x)
+        x = self.max_pool(batch_g, x)
+        return th.sigmoid(self.fc1(x))
 
 
 # In[11]:
 
-def testf(loader,model):
+def testf(loader, model):
     with torch.no_grad():
         model.eval()
         correct = 0
         for data in loader:
-            x,y = data
-            #data = data.to(device)
-            output = model(data)
-            output = output[0]
-#             print(output)
-            output = float(output>0.5)
-#             print(output,data.y)
-            if output == y:
-#                 print('here')
-                correct = correct + 1
-#             print(correct)
-        return float(correct) / float(len(loader))
+            batch_g, batch_etypes, x, y = data
+            output = model(batch_g, batch_etypes, x, y)
+            output = output.detach().cpu().numpy()
+            output = (output >= 0.5).astype(np.float32)
+            labels = y.detach().cpu().numpy()
+            correct += (output == labels).astype(np.float32).sum()
+        return float(correct)
 
 
 def tune_train(config):
     maxacc=0
     best_model=0
-    model=nn.DataParallel(MyNet(config["l1"], config["k"], config["r"], config["batch_size"]))
+    model = MyNet(config["l1"], config["k"], config["r"], config["batch_size"])
     model = model.to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=config['lr'], momentum=0.9)
 
@@ -262,44 +348,40 @@ def tune_train(config):
     acc=[]
     
     for epoch in range(100):
-        test_acc = testf(test_loader,model)
-        print('before: ',test_acc,maxacc)
-        model.train()
+        # test_acc = testf(test_loader,model)
+        # print('before: ', test_acc, maxacc)
+        # model.train()
         loss_all = 0
         it = 0
-        loss_=torch.nn.BCELoss()
+        loss_func = torch.nn.BCELoss()
         for data in loader:
-            x, y = data
+            batch_g, batch_etypes, x, y = data
             optimizer.zero_grad()
-            output = model(data)
-            it+=1
-            #y = torch.cat([y for x,y in data]).to(output.device)
-            y = y.to(output.device)
-            loss = loss_(output, y.view(output.shape[0],1))
+            output = model(batch_g, batch_etypes, x, y)
+            it += 1
+            loss = loss_func(output, y)
             loss.backward()
-            loss_all += loss.item()
+            loss_all += loss.detach().item()
             optimizer.step()
-#         print(output,y.view(output.shape[0],1))
-        train_auc = testf(loader,model)
-        test_auc = testf(test_loader,model)
-#         print('Epoch: {:03d}, Loss: {:.5f}, Train AUC: {:.5f}, Test AUC: {:.5f}'.
-#               format(epoch, loss_all, train_auc, test_auc))
-        tune.report(loss=loss_all,accuracy=test_auc)
-        if test_auc>maxacc:
-            maxacc=test_auc
-            best_model=model
-#             print('best so far: ',test_auc)
-            torch.save(best_model.module.state_dict(), "model_best.pth")
-        if len(acc)==2:
-            if test_auc<=acc[0] and test_auc<=acc[1]:
-                continue
-            else:
-                del(acc[0])
-                acc.append(test_auc)
-        elif len(acc)<2:
-            acc.append(test_auc)
-        torch.save(model.module.state_dict(), "model_best.pth")
-        print(maxacc, config)
+        # train_auc = testf(loader, model)
+        # test_auc = testf(test_loader, model)
+        print('Epoch: {:03d}, Loss: {:.5f}'.format(epoch, loss_all))
+        # tune.report(loss=loss_all)
+        # if test_auc>maxacc:
+#             maxacc=test_auc
+#             best_model=model
+# #             print('best so far: ',test_auc)
+#             torch.save(best_model.state_dict(), "model_best.pth")
+#         if len(acc) == 2:
+#             if test_auc <= acc[0] and test_auc <= acc[1]:
+#                 continue
+#             else:
+#                 del(acc[0])
+#                 acc.append(test_auc)
+#         elif len(acc) < 2:
+#             acc.append(test_auc)
+#         torch.save(model.state_dict(), "model_best.pth")
+#         print(maxacc, config)
 preds=[]
 trues=[]
 
@@ -323,7 +405,7 @@ def main():
             for a in r:
                 for c in lr:
                     for b in batch_size:
-                        tune_train({"l1": i, "k": j, "r":a, "lr": c, "batch_size": b})
+                        tune_train({"l1": i, "k": j, "r":a, "lr": c, "batch_size": 1})
                         return
 #     scheduler = ASHAScheduler(
 #             metric="loss",
